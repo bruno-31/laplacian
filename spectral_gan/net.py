@@ -45,7 +45,7 @@ class DCGANGenerator(object):
         if self.z_distribution == 'normal':
             return np.random.randn(self.batch_size, self.hidden_dim).astype(np.float32)
         elif self.z_distribution == 'uniform':
-            return np.random.uniform(-1, 1, (self.batch_size, self.hidden_dim)).astype(np.float32)
+            return np.random.uniform(-1, 1, (self.hidden_dim)).astype(np.float32)
         else:
             raise NotImplementedError
 
@@ -85,3 +85,4 @@ class SNDCGAN_Discrminator(object):
             l4 = linear(c3_0, self.output_dim, spectral_normed=True, update_collection=update_collection, stddev=0.02,
                         name='l4')
         return tf.reshape(l4, [-1])
+

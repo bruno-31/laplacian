@@ -1,0 +1,22 @@
+Traceback (most recent call last):
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/tune/trial_runner.py", line 218, in _process_events
+    result = ray.get(result_id)
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/worker.py", line 2320, in get
+    raise RayGetError(object_ids, value)
+ray.worker.RayGetError: Could not get objectid ObjectID(e83fa5fabad25324e4ac13ab24ff77c7df4b44b1). It was created by remote function [31mtrain[39m which failed with:
+
+Remote function [31mtrain[39m failed with:
+
+Traceback (most recent call last):
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/worker.py", line 821, in _process_task
+    *arguments)
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/actor.py", line 212, in actor_method_executor
+    method_returns = method(actor, *args)
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/tune/trainable.py", line 109, in train
+    result = self._train()
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/tune/function_runner.py", line 110, in _train
+    result = self._status_reporter._get_and_clear_status()
+  File "/home/bruno/anaconda3/lib/python3.6/site-packages/ray/tune/function_runner.py", line 41, in _get_and_clear_status
+    raise TuneError("Trial finished without reporting result!")
+ray.tune.error.TuneError: Trial finished without reporting result!
+

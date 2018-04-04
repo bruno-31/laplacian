@@ -8,7 +8,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_integer('batch_size', 64, '')
 
 mkdir('tmp')
-VIZ_VAR = True
+VIZ_VAR = False
 
 config = FLAGS.__flags
 generator = DCGANGenerator(**config)
@@ -30,9 +30,9 @@ if VIZ_VAR:
     print('')
     [print(var.name) for var in g_vars]
 
-all_var = tf.global_variables()
-print("list des vars")
-[print(var.name) for var in all_var]
+# all_var = tf.global_variables()
+# print("list des vars")
+# [print(var.name) for var in all_var]
 
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
@@ -42,6 +42,7 @@ sess.run(init_op)
 
 if tf.train.latest_checkpoint('snapshots') is not None:
     saver.restore(sess, tf.train.latest_checkpoint('snapshots'))
+    print('model restored')
 
 
 np.random.seed(1337)

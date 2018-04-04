@@ -1,0 +1,1 @@
+timesteps_total,done,info,episode_reward_mean,episode_len_mean,episodes_total,mean_accuracy,mean_validation_accuracy,mean_loss,neg_mean_loss,experiment_id,training_iteration,timesteps_this_iter,time_this_iter_s,time_total_s,pid,date,timestamp,hostname,node_ip,config

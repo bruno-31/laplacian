@@ -39,6 +39,19 @@ z = tf.placeholder(tf.float32, shape=[None, generator.generate_noise().shape[1]]
 x_hat = generator(z, is_training=is_training)
 x = tf.placeholder(tf.float32, shape=x_hat.shape)
 
+with tf.name_scope('loss_functions'):
+    l_unl = tf.reduce_logsumexp(logits_unl, axis=1)
+    l_gen = tf.reduce_logsumexp(logits_gen, axis=1)
+    # discriminator
+    loss_lab = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=lbl, logits=logits_lab))
+    loss_unl = - 0.5 * tf.reduce_mean(l_unl) \
+               + 0.5 * tf.reduce_mean(tf.nn.softplus(l_unl)) \
+               + 0.5 * tf.reduce_mean(tf.nn.softplus(l_gen))
+
+    # generator
+    m1 = tf.reduce_mean(layer_real, axis=0)
+    m2 = tf.reduce_mean(layer_fake, axis=0)
+
 d_fake = discriminator(x_hat, update_collection=None)
 # Don't need to collect on the second call, put NO_OPS
 d_real = discriminator(x, update_collection="NO_OPS")

@@ -2,29 +2,64 @@ import timeit
 
 import numpy as np
 import tensorflow as tf
-import os
+
 from libs.input_helper import Cifar10
-from libs.utils import save_images, mkdir
+from libs.utils import save_images, mkdir, next_batch
 from net import DCGANGenerator, SNDCGAN_Discrminator
 import _pickle as pickle
 from libs.inception_score.model import get_inception_score
+import os
+from data import cifar10_input
+from lap_dnn.dnn import classifier
 
 flags = tf.app.flags
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('batch_size', 64, '')
 flags.DEFINE_integer('max_iter', 100000, '')
-flags.DEFINE_integer('snapshot_interval', 1000, 'interval of snapshot')
-flags.DEFINE_integer('evaluation_interval', 10000, 'interval of evalution')
+flags.DEFINE_integer('snapshot_interval', 10000, 'interval of snapshot')
+flags.DEFINE_integer('evaluation_interval', 10000, 'interval of evaluation')
+flags.DEFINE_integer('test_interval', 100, 'interval of evaluation')
+
 flags.DEFINE_integer('display_interval', 100, 'interval of displaying log to console')
 flags.DEFINE_float('adam_alpha', 0.0001, 'learning rate')
 flags.DEFINE_float('adam_beta1', 0.5, 'beta1 in Adam')
 flags.DEFINE_float('adam_beta2', 0.999, 'beta2 in Adam')
 flags.DEFINE_integer('n_dis', 1, 'n discrminator train')
+flags.DEFINE_string('snapshot', '/tmp/snaphots', 'snapshot directory')
+flags.DEFINE_string('data_dir', './tmp/data/cifar-10-python/', 'data directory')
+flags.DEFINE_integer('seed', 10, 'seed numpy')
+flags.DEFINE_integer('labeled', 400, 'labeled data per class')
 
 flags.DEFINE_string('logdir', './log', 'log directory')
-
+flags.DEFINE_float('reg_w', 1e-3, 'weight regularization')
 
 mkdir('tmp')
+
+
+##############################################
+trainx, trainy = cifar10_input._get_dataset(FLAGS.data_dir, 'train')  # float [-1 1] images
+testx, testy = cifar10_input._get_dataset(FLAGS.data_dir, 'test')
+trainx_unl = trainx.copy()
+# select labeled data
+rng = np.random.RandomState(FLAGS.seed)  # seed labels
+inds = rng.permutation(trainx.shape[0])
+trainx = trainx[inds]
+trainy = trainy[inds]
+txs = []
+tys = []
+for j in range(10):
+    txs.append(trainx[trainy == j][:FLAGS.labeled])
+    tys.append(trainy[trainy == j][:FLAGS.labeled])
+txs = np.concatenate(txs, axis=0)
+tys = np.concatenate(tys, axis=0)
+trainx = txs
+trainy = tys
+nr_batches_train = int(trainx.shape[0] / FLAGS.batch_size)
+nr_batches_test = int(testx.shape[0] / FLAGS.batch_size)
+print("trainx shape:", trainx.shape)
+##############################################
+x, y = next_batch(FLAGS.batch_size, trainx, labels=trainy)
+
 
 INCEPTION_FILENAME = 'inception_score.pkl'
 config = FLAGS.__flags
@@ -58,6 +93,46 @@ g_gvs = optimizer.compute_gradients(g_loss, var_list=g_vars)
 d_solver = optimizer.apply_gradients(d_gvs)
 g_solver = optimizer.apply_gradients(g_gvs)
 
+
+######################CNN########################
+inp = tf.placeholder(tf.float32, [FLAGS.batch_size, 32, 32, 3], name='data_input')
+lbl = tf.placeholder(tf.int32, [FLAGS.batch_size], name='lbl_input')
+
+logits = classifier(inp, is_training=is_training)
+logits_gen = classifier(x_hat, is_training=is_training, reuse=True)
+
+# print(logits_gen)
+k = []
+for j in range(10):
+    grad = tf.gradients(logits_gen[:, j], z)
+    # print(grad)
+    k.append(grad)
+J = tf.stack(k)
+J = tf.squeeze(J)
+J = tf.transpose(J, perm=[1, 0, 2])  # jacobian
+j_n = tf.reduce_sum(tf.square(J), axis=[1, 2])
+laplacian = tf.reduce_mean(j_n)
+
+loss = tf.losses.sparse_softmax_cross_entropy(logits=logits, labels=lbl) + FLAGS.reg_w * laplacian
+
+correct_prediction = tf.equal(tf.cast(tf.argmax(logits, 1), tf.int32), lbl)
+accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+# dnn_vars = [var for var in tf.global_variables() if 'dnn' in var.name]
+dnn_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='classifier')
+
+optimizer = tf.train.AdamOptimizer(learning_rate=3e-3)
+update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope='classifier')# control dependencies for batch norm ops
+# print("update ops")
+# [print(op) for op in update_ops]
+# print("")
+# print("vars dnn")
+# [print(var) for var in dnn_vars]
+# print("")
+
+with tf.control_dependencies(update_ops):
+    train_op = optimizer.minimize(loss, var_list=dnn_vars)
+#################################################
+
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
 sess = tf.Session(config=config)
@@ -78,11 +153,16 @@ while iteration < FLAGS.max_iter:
     _, g_loss_curr = sess.run([g_solver, g_loss], feed_dict={z: generator.generate_noise(), is_training: True})
     for _ in range(FLAGS.n_dis):
         _, d_loss_curr, summaries = sess.run([d_solver, d_loss, merged_summary_op],
-                                             feed_dict={x: data_set.get_next_batch(), z: generator.generate_noise(),
-                                                        is_training: True})
-    # increase global step after updating G and D
-    # before saving the model so that it will be written into the ckpt file
+                                             feed_dict={x: next_batch(FLAGS.batch_size,trainx_unl), z: generator.generate_noise(), is_training: True})
+
+        xx,yy = next_batch(FLAGS.batch_size, trainx, labels=trainy)
+
+        feed_dict = {z: generator.generate_noise(), inp: xx, lbl:yy,
+                     is_training: True}
+        _,acc = sess.run([train_op,accuracy],feed_dict=feed_dict)
+
     sess.run(increase_global_step)
+
 
     if (iteration + 1) % FLAGS.display_interval == 0 and not is_start_iteration:
         summary_writer.add_summary(summaries, global_step=iteration)
@@ -91,12 +171,29 @@ while iteration < FLAGS.max_iter:
                                                                               stop - start))
         start = stop
 
-    if (iteration + 1) % FLAGS.snapshot_interval == 0 and not is_start_iteration:
+    if (iteration + 1) % FLAGS.test_interval == 0 and not is_start_iteration: # compute classifier score
+        print("computing score classifier ........")
+        test_acc = 0
+        for t in range(nr_batches_test):
+            ran_from = t * FLAGS.batch_size
+            ran_to = (t + 1) * FLAGS.batch_size
+            feed_dict = {inp: testx[ran_from:ran_to],
+                         lbl: testy[ran_from:ran_to],
+                         is_training: False}
+
+            acc = sess.run(accuracy, feed_dict=feed_dict)
+            test_acc += acc
+        test_acc /= nr_batches_test
+
+        print("test acc = %.2f"%(test_acc))
+        print('...............')
+
+    if (iteration + 1) % FLAGS.snapshot_interval == 0 and not is_start_iteration: # saveimages and model
         saver.save(sess, os.path.join(FLAGS.logdir,'model.ckpt'), global_step=iteration)
         sample_images = sess.run(x_hat, feed_dict={z: sample_noise, is_training: False})
         save_images(sample_images, 'tmp/{:06d}.png'.format(iteration))
 
-    if (iteration + 1) % FLAGS.evaluation_interval == 0:
+    if (iteration + 1) % FLAGS.evaluation_interval == 0: # compute inception
         sample_images = sess.run(x_hat, feed_dict={z: sample_noise, is_training: False})
         save_images(sample_images, 'tmp/{:06d}.png'.format(iteration))
         # Sample 50000 images for evaluation
@@ -120,5 +217,6 @@ while iteration < FLAGS.max_iter:
         inception_scores.append(dict(mean=inception_score_mean, std=inception_score_std))
         with open(INCEPTION_FILENAME, 'wb') as f:
             pickle.dump(inception_scores, f)
+
     iteration += 1
     is_start_iteration = False
