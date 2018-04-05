@@ -15,7 +15,7 @@ flags.DEFINE_integer("mc_size", 100, "batch size [128]")
 flags.DEFINE_integer("epoch", 200, "batch size [128]")
 flags.DEFINE_integer("decay", 100, "batch size [128]")
 flags.DEFINE_string('data_dir', '/tmp/data/cifar-10-python', 'data directory')
-flags.DEFINE_string('logdir', './log', 'log directory')
+flags.DEFINE_string('logdir', './log/000', 'log directory')
 flags.DEFINE_string('snapshot', '/home/data/bruno/manifold/snapshots', 'snapshot directory')
 flags.DEFINE_float('ma_decay', 0.99, 'exp moving average for inference [0.9999]')
 flags.DEFINE_integer('freq_print', 200, 'frequency image print tensorboard [10000]')
@@ -111,8 +111,8 @@ def main(_):
         perturb = tf.random_normal([FLAGS.mc_size, latent_dim], mean=0, stddev=0.01)
         z_pert = z + FLAGS.scale * perturb / (
                     tf.expand_dims(tf.norm(perturb, axis=1), axis=1) * tf.ones([1, latent_dim]))
-        x_hat_pert = generator(z_pert, is_training=gan_is_training_pl, reuse=True)
-        logits_gen_perturb = classifier(x_hat_pert, is_training=is_training_pl, reuse=True)
+        x_pert = generator(z_pert, is_training=gan_is_training_pl, reuse=True)
+        logits_gen_perturb = classifier(x_pert, is_training=is_training_pl, reuse=True)
         j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_perturb), axis=1))
 
     elif FLAGS.grad == 'stochastic_v2':
