@@ -47,8 +47,8 @@ if __name__ == "__main__":
     #     "mc_size": tune.grid_search([200, 100, 50])}
 
     _config = {"verbose": args.verbose,
-               "labeled": tune.grid_search([10, 100, 200, 400]),
-               "grad": tune.grid_search(['stochastic'])}
+               "labeled": tune.grid_search([400]),
+               "grad": tune.grid_search(['grad_inp','grad_latent','no_reg', 'grad_mc'])}
 
     config ={}
     for d in (_config, ukn_args): config.update(d)

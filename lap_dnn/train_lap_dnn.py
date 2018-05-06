@@ -16,7 +16,7 @@ flags.DEFINE_integer("epoch", 200, "batch size [128]")
 flags.DEFINE_integer("decay", 100, "batch size [128]")
 flags.DEFINE_string('data_dir', '/tmp/data/cifar-10-python', 'data directory')
 flags.DEFINE_string('logdir', './log/000', 'log directory')
-flags.DEFINE_string('snapshot', '/home/data/bruno/manifold/snapshots', 'snapshot directory')
+flags.DEFINE_string('snapshot', './snapshots', 'snapshot directory')
 flags.DEFINE_float('ma_decay', 0.99, 'exp moving average for inference [0.9999]')
 flags.DEFINE_integer('freq_print', 200, 'frequency image print tensorboard [10000]')
 flags.DEFINE_integer('freq_test', 5, 'frequency image print tensorboard [10000]')
@@ -33,6 +33,8 @@ flags.DEFINE_boolean('reg', True, 'enable reg or not')
 
 flags.DEFINE_boolean('tiny_cnn', False, 'verbose')
 
+flags.DEFINE_float('reg_ambient', 1e-3, '[1e-2]')
+flags.DEFINE_float('reg_manifold', 1e-3, '[1e-2]')
 
 
 FLAGS = flags.FLAGS
@@ -48,7 +50,7 @@ def get_getter(ema):
 
 def main(_):
     print("\nParameters:")
-    for attr, value in sorted(FLAGS.__flags.items()):
+    for attr, value in FLAGS.__flags.items():
         print("{}={}".format(attr.lower(), value))
     print("")
     if not os.path.exists(FLAGS.logdir):
@@ -62,6 +64,8 @@ def main(_):
     inds = rng.permutation(trainx.shape[0])
     trainx = trainx[inds]
     trainy = trainy[inds]
+    print("first labels trainy: ", trainy[:10])
+
     txs = []
     tys = []
     for j in range(10):
@@ -74,7 +78,6 @@ def main(_):
     nr_batches_train = int(trainx.shape[0] / FLAGS.batch_size)
     nr_batches_test = int(testx.shape[0] / FLAGS.batch_size)
     print("trainx shape:", trainx.shape)
-
 
     # placeholder model
     inp = tf.placeholder(tf.float32, [FLAGS.batch_size, 32, 32, 3], name='data_input')
@@ -89,12 +92,14 @@ def main(_):
 
     generator = DCGANGenerator(batch_size=FLAGS.mc_size)
     latent_dim = generator.generate_noise().shape[1]
-    z = tf.placeholder(tf.float32, shape=[None, latent_dim])
+    z = tf.placeholder(tf.float32, shape=[FLAGS.mc_size, latent_dim])
 
     if not FLAGS.tiny_cnn:
         from dnn import classifier as classifier
+        print("standard cnn loaded")
     else:
         from dnn import tiny_classifier as classifier
+        print("tiny cnn loaded")
 
     x_hat = generator(z, is_training=gan_is_training_pl)
     logits = classifier(inp, is_training=is_training_pl)
@@ -102,8 +107,7 @@ def main(_):
 
     def get_jacobian(y,x):
         with tf.name_scope("jacob"):
-            grads = tf.stack([tf.gradients(yi, x)[0] for yi in tf.unstack(y, axis=1)],
-                             axis=2)
+            grads = tf.stack([tf.gradients(yi, x)[0] for yi in tf.unstack(y, axis=1)], axis=2)
         return grads
 
     if FLAGS.grad == 'stochastic':
@@ -114,17 +118,57 @@ def main(_):
         x_pert = generator(z_pert, is_training=gan_is_training_pl, reuse=True)
         logits_gen_perturb = classifier(x_pert, is_training=is_training_pl, reuse=True)
         j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_perturb), axis=1))
+        tf.reduce_mean(tf.reduce_sum(tf.square(get_jacobian(logits_gen,z)),axis=[1,2]))
 
     elif FLAGS.grad == 'stochastic_v2':
         print('stochastic v2 reg enabled ...')
-        perturb = tf.random_normal([FLAGS.mc_size, latent_dim], mean=0, stddev=0.01)
-        perturb_hat = tf.nn.l2_normalize(perturb,dim=[1])
-        x_pert = generator(perturb_hat, is_training=gan_is_training_pl, reuse=True)
+        perturb = tf.nn.l2_normalize(tf.random_normal([FLAGS.mc_size, latent_dim], mean=0, stddev=0.01), dim=[1])
+        x_pert = generator(z+FLAGS.scale * perturb, is_training=gan_is_training_pl, reuse=True)
         logits_gen_perturb = classifier(x_pert, is_training=is_training_pl, reuse=True)
         j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_perturb), axis=1))
 
-    elif FLAGS.grad == 'gradient':
-        print('stochastic reg enabled ...')
+    elif FLAGS.grad == 'isotropic_mc':
+        print('isotropic mc reg enabled ...')
+        perturb = tf.nn.l2_normalize(tf.random_normal([FLAGS.mc_size]+inp.get_shape().as_list()[-3:], mean=0, stddev=0.01), dim=[1, 2, 3]) # gaussian noise [mc_size, 32,32,3]
+        x_pert = x_hat+FLAGS.scale * perturb
+        logits_gen_pert = classifier(x_pert, is_training=is_training_pl,reuse=True)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_pert), axis=1))
+
+    elif FLAGS.grad == 'isotropic_inp':
+        print('isotropic inp reg enabled ...')
+        perturb = tf.nn.l2_normalize(tf.random_normal([FLAGS.mc_size] + inp.get_shape().as_list()[-3:], mean=0,
+                                   stddev=0.01), dim=[1, 2, 3])   # gaussian noise [mc_size, 32,32,3]
+        x_pert = inp + FLAGS.scale * perturb
+        logits_inp_pert = classifier(x_pert, is_training=is_training_pl, reuse=True)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_inp_pert), axis=1))
+
+    elif FLAGS.grad == 'isotropic_rnd':
+        print('isotropic rnd reg enabled ...')
+        epsilon = tf.random_normal([FLAGS.mc_size] + inp.get_shape().as_list()[-3:], mean=0,
+                                   stddev=0.01)  # gaussian noise [mc_size, 32,32,3]
+        epsilon_hat = tf.nn.l2_normalize(epsilon, dim=[1, 2, 3])  # normalised gaussian noise [mc_size, 32,32,3]
+        rnd_img = tf.random_uniform(shape=[FLAGS.mc_size] + inp.get_shape().as_list()[-3:], minval=-1,maxval=1)
+        x_pert = rnd_img + FLAGS.scale * epsilon_hat
+        logits_pert= classifier(x_pert, is_training=is_training_pl, reuse=True)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_pert), axis=1))
+
+    elif FLAGS.grad == 'grad_latent':
+        print('grad latent enabled ...')
+        grad = get_jacobian(logits_gen, z)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(grad), axis=[1, 2]))
+
+    elif FLAGS.grad == 'grad_mc':
+        print('grad mc enabled ...')
+        grad = get_jacobian(logits_gen, x_hat)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(grad), axis=[1, 2]))
+
+    elif FLAGS.grad == 'grad_inp':
+        print('grad inp enabled ...')
+        grad = get_jacobian(logits, inp)
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(grad), axis=[1, 2]))
+
+    elif FLAGS.grad == 'grad_old':
+        print('old grad enabled ...')
         k=[]
         for j in range(10):
             grad = tf.gradients(logits_gen[:, j], z)
@@ -135,43 +179,29 @@ def main(_):
         j_n = tf.reduce_sum(tf.square(J), axis=[1, 2])
         j_loss = tf.reduce_mean(j_n)
 
+    elif FLAGS.grad == 'comb':
+        jac_manifold = []
+        jac_ambient = []
+        for yi in tf.unstack(logits_gen, axis=1):
+            g1,g2 = tf.gradients(yi,[z,x_hat])
+            jac_ambient.append(g2)
+            jac_manifold.append(g1)
+        jm = tf.square(tf.stack(jac_manifold))
+        ja = tf.square(tf.stack(jac_ambient))
 
-    elif FLAGS.grad == 'isotropic_mc':
-        print('isotropic mc reg enabled ...')
-        epsilon = tf.random_normal([FLAGS.mc_size]+inp.get_shape().as_list()[-3:], mean=0, stddev=0.01) # gaussian noise [mc_size, 32,32,3]
-        epsilon_hat = tf.nn.l2_normalize(epsilon, dim=[1, 2, 3]) # normalised gaussian noise [mc_size, 32,32,3]
-        x_pert = x_hat+FLAGS.scale * epsilon_hat
-        logits_gen_pert_iso = classifier(x_pert, is_training=is_training_pl,reuse=True)
-        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_pert_iso), axis=1))
-
-    elif FLAGS.grad == 'isotropic_inp':
-        print('isotropic inp reg enabled ...')
-        epsilon = tf.random_normal([FLAGS.mc_size] + inp.get_shape().as_list()[-3:], mean=0,
-                                   stddev=0.01)  # gaussian noise [mc_size, 32,32,3]
-        epsilon_hat = tf.nn.l2_normalize(epsilon, dim=[1, 2, 3])  # normalised gaussian noise [mc_size, 32,32,3]
-        x_pert = inp + FLAGS.scale * epsilon_hat
-        logits_inp_pert_iso = classifier(x_pert, is_training=is_training_pl, reuse=True)
-        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_inp_pert_iso), axis=1))
-
-    elif FLAGS.grad == 'isotropic_rnd':
-        print('isotropic rnd reg enabled ...')
-        epsilon = tf.random_normal([FLAGS.mc_size] + inp.get_shape().as_list()[-3:], mean=0,
-                                   stddev=0.01)  # gaussian noise [mc_size, 32,32,3]
-        epsilon_hat = tf.nn.l2_normalize(epsilon, dim=[1, 2, 3])  # normalised gaussian noise [mc_size, 32,32,3]
-        rnd_img = tf.random_uniform(shape=[FLAGS.mc_size] + inp.get_shape().as_list()[-3:], minval=-1,maxval=1)
-        x_pert = rnd_img + FLAGS.scale * epsilon_hat
-        logits_inp_pert_iso = classifier(x_pert, is_training=is_training_pl, reuse=True)
-        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_inp_pert_iso), axis=1))
+        j_manifold= tf.reduce_mean(tf.reduce_sum(jm,axis=[0,2]))
+        j_ambient = tf.reduce_mean(tf.reduce_sum(ja,axis=[0,2,3,4]))
+        j_loss = tf.constant(0.)
 
     ######## loss function #######
     xentropy = tf.losses.sparse_softmax_cross_entropy(logits=logits, labels=lbl)
-
-    if FLAGS.reg:
-        print('regularrization enabled')
-        loss = xentropy + FLAGS.reg_w * j_loss
-    else:
-        print('cnn baseline ...')
+    if not FLAGS.reg:
+        print('reg disabeled')
         loss = xentropy
+    else:
+        print('laplacian reg enabled')
+        loss = xentropy + FLAGS.reg_ambient * j_ambient + FLAGS.reg_manifold * j_manifold
+
 
     correct_prediction = tf.equal(tf.cast(tf.argmax(logits, 1), tf.int32), lbl)
     accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
@@ -219,7 +249,7 @@ def main(_):
 
         with tf.name_scope('images'):
             tf.summary.image('gen_images', x_hat, 4, ['image'])
-            tf.summary.image('gen_pert', x_pert, 4, ['image'])
+            # tf.summary.image('gen_pert', x_pert, 4, ['image'])
 
         with tf.name_scope('epoch'):
             tf.summary.scalar('accuracy_train', acc_train_pl, ['epoch'])
@@ -232,6 +262,7 @@ def main(_):
         sum_op_epoch = tf.summary.merge_all('epoch')
 
     print("batch size monte carlo: ",generator.generate_noise().shape)
+    print("")
 
     saver = tf.train.Saver(var_list=g_vars)
     var_init = [var for var in tf.global_variables() if var not in g_vars]
@@ -239,7 +270,6 @@ def main(_):
 
     # config = tf.ConfigProto(device_count={'GPU': 0})
     # config.gpu_options.allow_growth = True
-
 
     with tf.Session() as sess:
         writer = tf.summary.FileWriter(FLAGS.logdir, sess.graph)
@@ -323,11 +353,6 @@ def train_with_dic(config=None, reporter=None):
     argv = []     # config dic => argv
     for key, value in config.items():
         argv.extend(['--'+key, str(value)])
-
-    # print("\nParameters:")
-    # for attr, value in sorted(config.items()):
-    #     print("{}={}".format(attr.lower(), value))
-    # print("")
 
     if config['verbose'] == 'True':
         tf.app.run(main=main, argv=[sys.argv[0]] + argv)

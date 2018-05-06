@@ -3,19 +3,21 @@ import time
 
 import numpy as np
 import tensorflow as tf
-from tqdm import tqdm
 
 from data import cifar10_input
-# from cifar_gan import discriminator, generator
+from cifar_gan import discriminator, generator
 import sys
-from net import DCGANGenerator, SNDCGAN_Discrminator
+import _pickle as pickle
+
+from libs.inception_score.model import get_inception_score
+from libs.utils import save_images
 
 
 # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 flags = tf.app.flags
 flags.DEFINE_integer("batch_size", 25, "batch size [250]")
-flags.DEFINE_string('data_dir', '/tmp/data/cifar-10-python', 'data directory')
+flags.DEFINE_string('data_dir', './data/cifar-10-python', 'data directory')
 flags.DEFINE_string('logdir', './log/cifar', 'log directory')
 flags.DEFINE_integer('seed', 10, 'seed numpy')
 flags.DEFINE_integer('seed_data', 10, 'seed data')
@@ -31,11 +33,8 @@ flags.DEFINE_integer('decay_start', 1200, 'start of learning rate decay')
 flags.DEFINE_integer('epoch', 1400, 'labeled data per class')
 flags.DEFINE_boolean('nabla', True, 'enable manifold reg')
 
-flags.DEFINE_float('adam_alpha', 0.0001, 'learning rate')
-flags.DEFINE_float('adam_beta1', 0.5, 'beta1 in Adam')
-flags.DEFINE_float('adam_beta2', 0.999, 'beta2 in Adam')
 
-flags.DEFINE_integer('freq_print', 100, 'frequency image print tensorboard [10000]')
+flags.DEFINE_integer('freq_print', 10000, 'frequency image print tensorboard [10000]')
 flags.DEFINE_integer('step_print', 50, 'frequency scalar print tensorboard [50]')
 flags.DEFINE_integer('freq_test', 1, 'frequency test [500]')
 flags.DEFINE_integer('freq_save', 50, 'frequency saver epoch[50]')
@@ -46,6 +45,8 @@ print("\nParameters:")
 for attr, value in sorted(FLAGS.__flags.items()):
     print("{}={}".format(attr.lower(), value))
 print("")
+
+INCEPTION_FILENAME = 'inception_score.pkl'
 
 
 def get_getter(ema):
@@ -94,12 +95,13 @@ def main(_):
     txs = np.concatenate(txs, axis=0)
     tys = np.concatenate(tys, axis=0)
 
-    config = FLAGS.__flags
-    generator = DCGANGenerator(**config)
-    discriminator = SNDCGAN_Discrminator(output_dim=10, features=True, **config)
-
-    global_step = tf.Variable(0, name="global_step", trainable=False)
-    increase_global_step = global_step.assign(global_step + 1)
+    print("Data:")
+    print('train examples %d, batch %d, test examples %d, batch %d' \
+          % (trainx.shape[0], nr_batches_train, testx.shape[0], nr_batches_test))
+    print('histogram train', np.histogram(trainy, bins=10)[0])
+    print('histogram test ', np.histogram(testy, bins=10)[0])
+    print("histogram labeled", np.histogram(tys, bins=10)[0])
+    print("")
 
     '''construct graph'''
     print('constructing graph')
@@ -107,19 +109,26 @@ def main(_):
     is_training_pl = tf.placeholder(tf.bool, [], name='is_training_pl')
     inp = tf.placeholder(tf.float32, [FLAGS.batch_size, 32, 32, 3], name='labeled_data_input_pl')
     lbl = tf.placeholder(tf.int32, [FLAGS.batch_size], name='lbl_input_pl')
-
     # scalar pl
     lr_pl = tf.placeholder(tf.float32, [], name='learning_rate_pl')
     acc_train_pl = tf.placeholder(tf.float32, [], 'acc_train_pl')
     acc_test_pl = tf.placeholder(tf.float32, [], 'acc_test_pl')
     acc_test_pl_ema = tf.placeholder(tf.float32, [], 'acc_test_pl')
+    kl_weight = tf.placeholder(tf.float32, [], 'kl_weight')
 
     random_z = tf.random_uniform([FLAGS.batch_size, 100], name='random_z')
-    gen_inp = generator(random_z, is_training_pl)
-    logits_gen, layer_fake = discriminator(gen_inp, update_collection=None, features=True)
-    logits_unl, layer_real = discriminator(unl, update_collection="NO_OPS", features=True)
-    logits_lab, _ = discriminator(inp, update_collection="NO_OPS")
+    perturb = tf.random_normal([FLAGS.batch_size, 100], mean=0, stddev=0.01)
+    random_z_pert = random_z + FLAGS.scale * perturb / (
+    tf.expand_dims(tf.norm(perturb, axis=1), axis=1) * tf.ones([1, 100]))
+    generator(random_z, is_training_pl, init=True)  # init of weightnorm weights
+    gen_inp = generator(random_z, is_training_pl, init=False, reuse=True)
+    gen_inp_pert = generator(random_z_pert, is_training_pl, init=False, reuse=True)
 
+    discriminator(unl, is_training_pl, init=True)
+    logits_lab, _ = discriminator(inp, is_training_pl, init=False, reuse=True)
+    logits_gen, layer_fake = discriminator(gen_inp, is_training_pl, init=False, reuse=True)
+    logits_unl, layer_real = discriminator(unl, is_training_pl, init=False, reuse=True)
+    logits_gen_perturb, layer_fake_perturb = discriminator(gen_inp_pert, is_training_pl, init=False, reuse=True)
 
     with tf.name_scope('loss_functions'):
         l_unl = tf.reduce_logsumexp(logits_unl, axis=1)
@@ -133,38 +142,54 @@ def main(_):
         # generator
         m1 = tf.reduce_mean(layer_real, axis=0)
         m2 = tf.reduce_mean(layer_fake, axis=0)
-        loss_gen = tf.reduce_mean(tf.abs(m1 - m2))
-        loss_dis = FLAGS.unl_weight * loss_unl + FLAGS.lbl_weight * loss_lab
+
+        j_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logits_gen - logits_gen_perturb),axis=1))
+
+        if FLAGS.nabla:
+            loss_dis = FLAGS.unl_weight * loss_unl + FLAGS.lbl_weight * loss_lab + kl_weight * j_loss
+            loss_gen = tf.reduce_mean(tf.abs(m1 - m2))
+            print('manifold reg enabled')
+        else:
+            loss_dis = FLAGS.unl_weight * loss_unl + FLAGS.lbl_weight * loss_lab
+            loss_gen = tf.reduce_mean(tf.abs(m1 - m2))
 
         correct_pred = tf.equal(tf.cast(tf.argmax(logits_lab, 1), tf.int32), tf.cast(lbl, tf.int32))
         accuracy_classifier = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
 
 
     with tf.name_scope('optimizers'):
-        d_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
-        g_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='generator')
+        # control op dependencies for batch norm and trainable variables
+        tvars = tf.trainable_variables()
 
-        optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.adam_alpha, beta1=FLAGS.adam_beta1,
-                                           beta2=FLAGS.adam_beta2)
+        dvars = [var for var in tvars if 'discriminator_model' in var.name]
+        gvars = [var for var in tvars if 'generator_model' in var.name]
 
-        d_gvs = optimizer.compute_gradients(loss_dis, var_list=d_vars)
-        g_gvs = optimizer.compute_gradients(loss_gen, var_list=g_vars)
-        d_solver = optimizer.apply_gradients(d_gvs)
-        g_solver = optimizer.apply_gradients(g_gvs)
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        update_ops_gen = [x for x in update_ops if ('generator_model' in x.name)]
+        update_ops_dis = [x for x in update_ops if ('discriminator_model' in x.name)]
 
-    ema = tf.train.ExponentialMovingAverage(decay=FLAGS.ma_decay)
-    maintain_averages_op = ema.apply(d_vars)
+        optimizer_dis = tf.train.AdamOptimizer(learning_rate=lr_pl, beta1=0.5, name='dis_optimizer')
+        optimizer_gen = tf.train.AdamOptimizer(learning_rate=lr_pl, beta1=0.5, name='gen_optimizer')
 
-    with tf.control_dependencies([d_solver]):
-        train_dis_op = tf.group(maintain_averages_op)
+        with tf.control_dependencies(update_ops_gen):
+            train_gen_op = optimizer_gen.minimize(loss_gen, var_list=gvars)
 
-    logits_ema, _ = discriminator(inp, update_collection="NO_OPS", getter=get_getter(ema))
-    correct_pred_ema = tf.equal(tf.cast(tf.argmax(logits_ema, 1), tf.int32), tf.cast(lbl, tf.int32))
-    accuracy_ema = tf.reduce_mean(tf.cast(correct_pred_ema, tf.float32))
+        dis_op = optimizer_dis.minimize(loss_dis, var_list=dvars)
+
+        ema = tf.train.ExponentialMovingAverage(decay=FLAGS.ma_decay)
+        maintain_averages_op = ema.apply(dvars)
+
+        with tf.control_dependencies([dis_op]):
+            train_dis_op = tf.group(maintain_averages_op)
+
+        logits_ema, _ = discriminator(inp, is_training_pl, getter=get_getter(ema), reuse=True)
+        correct_pred_ema = tf.equal(tf.cast(tf.argmax(logits_ema, 1), tf.int32), tf.cast(lbl, tf.int32))
+        accuracy_ema = tf.reduce_mean(tf.cast(correct_pred_ema, tf.float32))
 
     with tf.name_scope('summary'):
         with tf.name_scope('discriminator'):
             tf.summary.scalar('loss_discriminator', loss_dis, ['dis'])
+            tf.summary.scalar('kl_loss', j_loss, ['dis'])
 
         with tf.name_scope('generator'):
             tf.summary.scalar('loss_generator', loss_gen, ['gen'])
@@ -177,28 +202,53 @@ def main(_):
             tf.summary.scalar('accuracy_test_moving_average', acc_test_pl_ema, ['epoch'])
             tf.summary.scalar('accuracy_test_raw', acc_test_pl, ['epoch'])
             tf.summary.scalar('learning_rate', lr_pl, ['epoch'])
+            tf.summary.scalar('j_weight', kl_weight, ['epoch'])
 
         sum_op_dis = tf.summary.merge_all('dis')
         sum_op_gen = tf.summary.merge_all('gen')
         sum_op_im = tf.summary.merge_all('image')
         sum_op_epoch = tf.summary.merge_all('epoch')
 
+    # training global varialble
+    global_epoch = tf.Variable(0, trainable=False, name='global_epoch')
+    global_step = tf.Variable(0, trainable=False, name='global_step')
+    inc_global_step = tf.assign(global_step, global_step+1)
+    inc_global_epoch = tf.assign(global_epoch, global_epoch+1)
+
+    # op initializer for session manager
+    init_gen = [var.initializer for var in gvars][:-3]
+    with tf.control_dependencies(init_gen):
+        op = tf.global_variables_initializer()
+    init_feed_dict = {inp: trainx_unl[:FLAGS.batch_size], unl: trainx_unl[:FLAGS.batch_size],
+                                  is_training_pl: True, kl_weight: 0}
+
+    sv = tf.train.Supervisor(logdir=FLAGS.logdir, global_step=global_epoch, summary_op=None, save_model_secs=0,
+                             init_op=op,init_feed_dict=init_feed_dict)
+
+    inception_scores = []
+
     '''//////training //////'''
     print('start training')
-    with tf.Session() as sess:
+    with sv.managed_session() as sess:
         tf.set_random_seed(rng.randint(2 ** 10))
-        sess.run(tf.global_variables_initializer())
         print('\ninitialization done')
+        print('Starting training from epoch :%d, step:%d \n'%(sess.run(global_epoch),sess.run(global_step)))
 
         writer = tf.summary.FileWriter(FLAGS.logdir, sess.graph)
 
-        train_batch = 0
+        while not sv.should_stop():
+            epoch = sess.run(global_epoch)
+            train_batch = sess.run(global_step)
 
-        for epoch in tqdm(range(FLAGS.epoch)):
+            if (epoch >= FLAGS.epoch):
+                print("Training done")
+                sv.stop()
+                break
+
             begin = time.time()
-
             train_loss_lab=train_loss_unl=train_loss_gen=train_acc=test_acc=test_acc_ma=train_j_loss = 0
             lr = FLAGS.learning_rate * linear_decay(FLAGS.decay_start,FLAGS.epoch,epoch)
+            klw = FLAGS.nabla_w
 
             # construct randomly permuted batches
             trainx = []
@@ -213,8 +263,9 @@ def main(_):
             trainx_unl2 = trainx_unl2[rng.permutation(trainx_unl2.shape[0])]
 
             # training
-            for t in tqdm(range(nr_batches_train)):
+            for t in range(nr_batches_train):
 
+                display_progression_epoch(t, nr_batches_train)
                 ran_from = t * FLAGS.batch_size
                 ran_to = (t + 1) * FLAGS.batch_size
 
@@ -223,19 +274,20 @@ def main(_):
                              is_training_pl: True,
                              inp: trainx[ran_from:ran_to],
                              lbl: trainy[ran_from:ran_to],
-                             lr_pl: lr}
-                _, acc, lu, lb, sm = sess.run([train_dis_op, accuracy_classifier, loss_lab, loss_unl, sum_op_dis],
+                             lr_pl: lr, kl_weight: klw}
+                _, acc, lu, lb, jl, sm = sess.run([train_dis_op, accuracy_classifier, loss_lab, loss_unl, j_loss, sum_op_dis],
                                                   feed_dict=feed_dict)
                 train_loss_unl += lu
                 train_loss_lab += lb
                 train_acc += acc
+                train_j_loss += jl
                 if (train_batch % FLAGS.step_print) == 0:
                     writer.add_summary(sm, train_batch)
 
                 # train generator
-                _, lg, sm = sess.run([g_solver, loss_gen, sum_op_gen], feed_dict={unl: trainx_unl2[ran_from:ran_to],
+                _, lg, sm = sess.run([train_gen_op, loss_gen, sum_op_gen], feed_dict={unl: trainx_unl2[ran_from:ran_to],
                                                                                       is_training_pl: True,
-                                                                                      lr_pl: lr})
+                                                                                      lr_pl: lr, kl_weight: klw})
                 train_loss_gen += lg
                 if (train_batch % FLAGS.step_print) == 0:
                     writer.add_summary(sm, train_batch)
@@ -248,6 +300,7 @@ def main(_):
                     writer.add_summary(sm, train_batch)
 
                 train_batch += 1
+                sess.run(inc_global_step)
 
             train_loss_lab /= nr_batches_train
             train_loss_unl /= nr_batches_train
@@ -269,11 +322,50 @@ def main(_):
                 test_acc /= nr_batches_test
                 test_acc_ma /= nr_batches_test
 
+                sum = sess.run(sum_op_epoch, feed_dict={acc_train_pl: train_acc,
+                                                        acc_test_pl: test_acc,
+                                                        acc_test_pl_ema: test_acc_ma,
+                                                        lr_pl: lr, kl_weight: klw})
+                writer.add_summary(sum, epoch)
+
                 print(
                     "Epoch %d | time = %ds | loss gen = %.4f | loss lab = %.4f | loss unl = %.4f "
                     "| train acc = %.4f| test acc = %.4f | test acc ema = %0.4f"
                     % (epoch, time.time() - begin, train_loss_gen, train_loss_lab, train_loss_unl, train_acc,
                        test_acc, test_acc_ma))
+
+            sess.run(inc_global_epoch)
+
+            # save snap shot of model
+            if ((epoch % FLAGS.freq_save == 0) & (epoch!=0) ) | (epoch == FLAGS.epoch-1):
+                string = 'model-' + str(epoch)
+                save_path = os.path.join(FLAGS.logdir, string)
+                sv.saver.save(sess, save_path)
+                print("Model saved in file: %s" % (save_path))
+
+            print("saving images...")
+            sample_images = sess.run(gen_inp, feed_dict={is_training_pl:False})
+            save_images(sample_images, os.path.join(FLAGS.logdir ,'{:06d}.png'.format(epoch)))
+            print('images saved @ ' + os.path.join(FLAGS.logdir ,'{:06d}.png'.format(epoch)))
+            num_images_to_eval = 50000
+            eval_images = []
+            num_batches = num_images_to_eval // FLAGS.batch_size + 1
+            print("Calculating Inception Score. Sampling {} images...".format(num_images_to_eval))
+            np.random.seed(0)
+            for _ in range(num_batches):
+                images = sess.run(gen_inp, feed_dict={is_training_pl:False})
+                eval_images.append(images)
+            np.random.seed()
+            eval_images = np.vstack(eval_images)
+            eval_images = eval_images[:num_images_to_eval]
+            eval_images = np.clip((eval_images + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+            # Calc Inception score
+            eval_images = list(eval_images)
+            inception_score_mean, inception_score_std = get_inception_score(eval_images)
+            print("Inception Score: Mean = {} \tStd = {}.".format(inception_score_mean, inception_score_std))
+            inception_scores.append(dict(mean=inception_score_mean, std=inception_score_std))
+            with open(INCEPTION_FILENAME, 'wb') as f:
+                pickle.dump(inception_scores, f)
 
 if __name__ == '__main__':
     tf.app.run()

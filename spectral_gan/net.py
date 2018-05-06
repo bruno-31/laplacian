@@ -52,14 +52,15 @@ class DCGANGenerator(object):
 
 class SNDCGAN_Discrminator(object):
 
-    def __init__(self, batch_size=64, hidden_activation=lrelu, output_dim=1, scope='critic', **kwargs):
+    def __init__(self, batch_size=64, hidden_activation=lrelu, output_dim=1, scope='critic', features=False,**kwargs):
         self.batch_size = batch_size
         self.hidden_activation = hidden_activation
         self.output_dim = output_dim
         self.scope = scope
+        self.features = features
 
-    def __call__(self, x, update_collection=tf.GraphKeys.UPDATE_OPS, **kwargs):
-        with tf.variable_scope(self.scope):
+    def __call__(self, x, update_collection=tf.GraphKeys.UPDATE_OPS,getter =None, **kwargs):
+        with tf.variable_scope(self.scope,custom_getter=getter):
             c0_0 = self.hidden_activation(
                 conv2d(x, 64, 3, 3, 1, 1, spectral_normed=True, update_collection=update_collection, stddev=0.02,
                        name='c0_0'))
@@ -84,5 +85,9 @@ class SNDCGAN_Discrminator(object):
             c3_0 = tf.reshape(c3_0, [self.batch_size, -1])
             l4 = linear(c3_0, self.output_dim, spectral_normed=True, update_collection=update_collection, stddev=0.02,
                         name='l4')
-        return tf.reshape(l4, [-1])
+            if self.features:
+                # return tf.reshape(l4, [-1]), c3_0
+                return l4,c3_0
+            else:
+                return tf.reshape(l4, [-1])
 
